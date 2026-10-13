@@ -5,7 +5,7 @@ import errno
 from functools import wraps
 
 import torch
-from compressed_tensors.offload.cache.disk_utils import _opened
+from compressed_tensors.offload.cache.disk_utils import _opened, _opened_raw
 from compressed_tensors.offload.utils import to_tensor
 from loguru import logger
 
@@ -109,10 +109,17 @@ def load_disk_tensor_from_offload(
     offloaded: dict,
     device: str,
     template: torch.Tensor | None = None,
+    pin_memory: bool = False,
 ) -> torch.Tensor:
-    with _opened(offloaded["safetensors_file"], device) as file:
-        onloaded = file.get_tensor(offloaded["weight_name"])
-        onloaded = onloaded.to(getattr(torch, offloaded["dtype"]))
-        if template is not None:
-            onloaded = to_tensor(onloaded, template)
-        return onloaded
+    dtype = getattr(torch, offloaded["dtype"])
+    if pin_memory and device == "cpu" and torch.accelerator.is_available():
+        with _opened_raw(offloaded["safetensors_file"]) as file:
+            onloaded = file.get_tensor(
+                offloaded["weight_name"],
+                pin_memory=True,
+                dtype=dtype,
+            )
+    else:
+        with _opened(offloaded["safetensors_file"], device) as file:
+            onloaded = file.get_tensor(offloaded["weight_name"]).to(dtype)
+    return to_tensor(onloaded, template) if template is not None else onloaded
