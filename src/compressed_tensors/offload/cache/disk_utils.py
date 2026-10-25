@@ -2,11 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import contextlib
+import json
 import os
+import struct
+import sys
 import threading
 from collections import OrderedDict
-from typing import Iterator
+from typing import Callable, Iterator
 
+import torch
+from compressed_tensors.utils.safetensors_load import str_to_torch_dtype
 from safetensors import safe_open
 
 
@@ -35,7 +40,7 @@ _MAX_OPEN_FILES = 16
 @contextlib.contextmanager
 def disk_load_context() -> Iterator[None]:
     """
-    Hold safetensors file handles open for the duration of the block.
+    Hold safetensors and raw file handles open for the duration of the block.
 
     `safe_open` parses a header describing every tensor in the file, so the cost
     of opening is proportional to the number of tensors the file holds. Opening
@@ -74,16 +79,30 @@ def _opened(file_path: str, device: str) -> Iterator["safe_open"]:
     Outside that context this is an ordinary open/close, which keeps the
     uninstrumented path byte for byte what it was.
     """
+    with _cached_open(
+        file_path, device, lambda: safe_open(file_path, framework="pt", device=device)
+    ) as file:
+        yield file
+
+
+@contextlib.contextmanager
+def _opened_raw(file_path: str) -> Iterator["_RawSafetensorsFile"]:
+    with _cached_open(file_path, "raw", lambda: _RawSafetensorsFile(file_path)) as file:
+        yield file
+
+
+@contextlib.contextmanager
+def _cached_open(file_path: str, device: str, opener: Callable) -> Iterator:
     cache = _open_files.cache
     if cache is None:
-        with safe_open(file_path, framework="pt", device=device) as file:
+        with opener() as file:
             yield file
         return
 
     key = (_file_key(file_path), device)
     handle = cache.get(key)
     if handle is None:
-        handle = safe_open(file_path, framework="pt", device=device)
+        handle = opener()
         handle.__enter__()
         cache[key] = handle
         # Evict oldest first, never the handle just requested.
@@ -93,6 +112,78 @@ def _opened(file_path: str, device: str) -> Iterator["safe_open"]:
     else:
         cache.move_to_end(key)
     yield handle
+
+
+class _RawSafetensorsFile:
+    """Read safetensors payloads directly into CPU tensor storage."""
+
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+
+    def __enter__(self):
+        # Validate the shard without materializing tensor payloads.
+        with safe_open(self.file_path, framework="pt", device="cpu"):
+            self.file = open(self.file_path, "rb", buffering=0)
+            try:
+                header_size = struct.unpack("<Q", self.file.read(8))[0]
+                self.header = json.loads(self.file.read(header_size))
+                self.data_offset = 8 + header_size
+            except BaseException:
+                self.file.close()
+                raise
+        return self
+
+    def __exit__(self, *args):
+        self.file.close()
+
+    def get_tensor(
+        self, name: str, *, pin_memory: bool = False, dtype: torch.dtype | None = None
+    ) -> torch.Tensor:
+        info = self.header[name]
+        source_dtype = str_to_torch_dtype.get(info["dtype"])
+        if source_dtype is None:
+            with safe_open(self.file_path, framework="pt", device="cpu") as file:
+                source = file.get_tensor(name)
+            tensor = torch.empty(
+                source.shape,
+                dtype=dtype or source.dtype,
+                device="cpu",
+                pin_memory=pin_memory,
+            )
+            tensor.copy_(source)
+            return tensor
+
+        needs_cast = dtype is not None and dtype != source_dtype
+        tensor = torch.empty(
+            info["shape"],
+            dtype=source_dtype,
+            device="cpu",
+            pin_memory=pin_memory and not needs_cast,
+        )
+        start, end = info["data_offsets"]
+        if tensor.nbytes != end - start:
+            raise ValueError(f"Invalid byte length for tensor {name}")
+
+        # NumPy cannot represent BF16/FP8, so expose storage as bytes.
+        array = tensor.reshape(-1).view(torch.uint8).numpy()
+        remaining = memoryview(array)
+        self.file.seek(self.data_offset + start)
+        while remaining:
+            count = self.file.readinto(remaining)
+            if not count:
+                raise EOFError(f"Unexpected end of file reading tensor {name}")
+            remaining = remaining[count:]
+
+        if sys.byteorder == "big":
+            array.view(f"u{tensor.element_size()}").byteswap(inplace=True)
+
+        if needs_cast:
+            converted = torch.empty(
+                tensor.shape, dtype=dtype, device="cpu", pin_memory=pin_memory
+            )
+            converted.copy_(tensor)
+            tensor = converted
+        return tensor
 
 
 def _file_key(file_path: str) -> str:
