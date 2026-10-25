@@ -68,20 +68,17 @@ def disk_load_context() -> Iterator[None]:
 
 
 @contextlib.contextmanager
-def _opened(file_path: str, device: str) -> Iterator["safe_open"]:
+def _opened(file_path: str, device: str, raw: bool = False) -> Iterator[tuple]:
     """
-    Yield a safetensors handle for `file_path`, reusing an open one if the
-    caller is inside `disk_load_context`.
+    Yield (handle, header, data_offset), reusing an open reader inside
+    `disk_load_context`. For safetensors handles, header is None.
 
-    Outside that context this is an ordinary open/close, which keeps the
-    uninstrumented path byte for byte what it was.
+    Raw readers validate the file with safetensors before opening an unbuffered
+    byte stream. The format fixes the header length to a little-endian uint64;
+    tensor offsets in the JSON header are relative to the data section.
+
+    Outside the context, close the reader after each use.
     """
-    with _cached_open(file_path, device) as (file, _, _):
-        yield file
-
-
-@contextlib.contextmanager
-def _cached_open(file_path: str, device: str, raw: bool = False) -> Iterator[tuple]:
     cache = _open_files.cache
     key = (_file_key(file_path), "raw" if raw else device)
     entry = cache.get(key) if cache is not None else None

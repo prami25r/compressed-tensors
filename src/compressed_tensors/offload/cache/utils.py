@@ -6,7 +6,7 @@ import sys
 from functools import wraps
 
 import torch
-from compressed_tensors.offload.cache.disk_utils import _cached_open, _opened
+from compressed_tensors.offload.cache.disk_utils import _opened
 from compressed_tensors.offload.utils import _pin_memory, to_tensor
 from compressed_tensors.utils.safetensors_load import str_to_torch_dtype
 from loguru import logger
@@ -113,9 +113,15 @@ def load_disk_tensor_from_offload(
     template: torch.Tensor | None = None,
     pin_memory: bool = False,
 ) -> torch.Tensor:
+    """Load a tensor, reading matching dtypes directly into pinned CPU memory.
+
+    Dtype conversions use safetensors before pinning the result. Raw payloads
+    are little-endian, so big-endian hosts must swap bytes after reading.
+    """
     dtype = getattr(torch, offloaded["dtype"])
+    file_path = offloaded["safetensors_file"]
     pin_memory = pin_memory and torch.accelerator.is_available()
-    with _cached_open(offloaded["safetensors_file"], device, raw=pin_memory) as (
+    with _opened(file_path, device, raw=pin_memory) as (
         file,
         header,
         data_offset,
@@ -126,7 +132,7 @@ def load_disk_tensor_from_offload(
         else:
             info = header[name]
             if str_to_torch_dtype.get(info["dtype"]) != dtype:
-                with _opened(offloaded["safetensors_file"], device) as source_file:
+                with _opened(file_path, device) as (source_file, _, _):
                     onloaded = _pin_memory(source_file.get_tensor(name).to(dtype))
             else:
                 onloaded = torch.empty(

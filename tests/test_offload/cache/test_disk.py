@@ -257,14 +257,14 @@ def test_disk_load_context_reuses_one_handle_per_file(tmp_path, monkeypatch):
     opens = _counting_safe_open(monkeypatch)
     with disk_load_context():
         for i, name in enumerate(names):
-            with _opened(str(shard), "cpu") as file:
+            with _opened(str(shard), "cpu") as (file, _, _):
                 assert_tensor_equal(file.get_tensor(name), torch.full((4,), float(i)))
     assert len(opens) == 1, f"expected a single open, got {len(opens)}"
 
     # same reads outside the context open once each
     opens.clear()
     for name in names:
-        with _opened(str(shard), "cpu") as file:
+        with _opened(str(shard), "cpu") as (file, _, _):
             file.get_tensor(name)
     assert len(opens) == len(names)
 
@@ -303,7 +303,7 @@ def test_disk_load_context_closes_handles_on_exit(tmp_path):
     save_file({"a": torch.zeros(4)}, shard)
 
     with disk_load_context():
-        with _opened(str(shard), "cpu") as file:
+        with _opened(str(shard), "cpu") as (file, _, _):
             file.get_tensor("a")
         held = [entry[0] for entry in disk_module._open_files.cache.values()]
         assert held, "expected a cached handle"
@@ -315,7 +315,7 @@ def test_disk_load_context_closes_handles_on_exit(tmp_path):
     # and the same when the block raises
     with pytest.raises(RuntimeError):
         with disk_load_context():
-            with _opened(str(shard), "cpu") as file:
+            with _opened(str(shard), "cpu") as (file, _, _):
                 file.get_tensor("a")
             held = [entry[0] for entry in disk_module._open_files.cache.values()]
             raise RuntimeError("boom")
