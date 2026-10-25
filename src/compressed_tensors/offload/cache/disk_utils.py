@@ -5,13 +5,10 @@ import contextlib
 import json
 import os
 import struct
-import sys
 import threading
 from collections import OrderedDict
-from typing import Callable, Iterator
+from typing import Iterator
 
-import torch
-from compressed_tensors.utils.safetensors_load import str_to_torch_dtype
 from safetensors import safe_open
 
 
@@ -66,7 +63,7 @@ def disk_load_context() -> Iterator[None]:
         _open_files.depth -= 1
         if _open_files.depth == 0:
             cache, _open_files.cache = _open_files.cache, None
-            for handle in cache.values():
+            for handle, _, _ in cache.values():
                 handle.__exit__(None, None, None)
 
 
@@ -79,111 +76,42 @@ def _opened(file_path: str, device: str) -> Iterator["safe_open"]:
     Outside that context this is an ordinary open/close, which keeps the
     uninstrumented path byte for byte what it was.
     """
-    with _cached_open(
-        file_path, device, lambda: safe_open(file_path, framework="pt", device=device)
-    ) as file:
+    with _cached_open(file_path, device) as (file, _, _):
         yield file
 
 
 @contextlib.contextmanager
-def _opened_raw(file_path: str) -> Iterator["_RawSafetensorsFile"]:
-    with _cached_open(file_path, "raw", lambda: _RawSafetensorsFile(file_path)) as file:
-        yield file
-
-
-@contextlib.contextmanager
-def _cached_open(file_path: str, device: str, opener: Callable) -> Iterator:
+def _cached_open(file_path: str, device: str, raw: bool = False) -> Iterator[tuple]:
     cache = _open_files.cache
-    if cache is None:
-        with opener() as file:
-            yield file
-        return
-
-    key = (_file_key(file_path), device)
-    handle = cache.get(key)
-    if handle is None:
-        handle = opener()
+    key = (_file_key(file_path), "raw" if raw else device)
+    entry = cache.get(key) if cache is not None else None
+    if entry is None:
+        handle = safe_open(file_path, framework="pt", device=device)
         handle.__enter__()
-        cache[key] = handle
-        # Evict oldest first, never the handle just requested.
-        while len(cache) > _MAX_OPEN_FILES:
-            _, evicted = cache.popitem(last=False)
-            evicted.__exit__(None, None, None)
-    else:
-        cache.move_to_end(key)
-    yield handle
-
-
-class _RawSafetensorsFile:
-    """Read safetensors payloads directly into CPU tensor storage."""
-
-    def __init__(self, file_path: str):
-        self.file_path = file_path
-
-    def __enter__(self):
-        # Validate the shard without materializing tensor payloads.
-        with safe_open(self.file_path, framework="pt", device="cpu"):
-            self.file = open(self.file_path, "rb", buffering=0)
+        header, data_offset = None, 0
+        if raw:
+            handle.__exit__(None, None, None)
+            handle = open(file_path, "rb", buffering=0)
             try:
-                header_size = struct.unpack("<Q", self.file.read(8))[0]
-                self.header = json.loads(self.file.read(header_size))
-                self.data_offset = 8 + header_size
+                header_size = struct.unpack("<Q", handle.read(8))[0]
+                header = json.loads(handle.read(header_size))
+                data_offset = 8 + header_size
             except BaseException:
-                self.file.close()
+                handle.close()
                 raise
-        return self
-
-    def __exit__(self, *args):
-        self.file.close()
-
-    def get_tensor(
-        self, name: str, *, pin_memory: bool = False, dtype: torch.dtype | None = None
-    ) -> torch.Tensor:
-        info = self.header[name]
-        source_dtype = str_to_torch_dtype.get(info["dtype"])
-        if source_dtype is None:
-            with safe_open(self.file_path, framework="pt", device="cpu") as file:
-                source = file.get_tensor(name)
-            tensor = torch.empty(
-                source.shape,
-                dtype=dtype or source.dtype,
-                device="cpu",
-                pin_memory=pin_memory,
-            )
-            tensor.copy_(source)
-            return tensor
-
-        needs_cast = dtype is not None and dtype != source_dtype
-        tensor = torch.empty(
-            info["shape"],
-            dtype=source_dtype,
-            device="cpu",
-            pin_memory=pin_memory and not needs_cast,
-        )
-        start, end = info["data_offsets"]
-        if tensor.nbytes != end - start:
-            raise ValueError(f"Invalid byte length for tensor {name}")
-
-        # NumPy cannot represent BF16/FP8, so expose storage as bytes.
-        array = tensor.reshape(-1).view(torch.uint8).numpy()
-        remaining = memoryview(array)
-        self.file.seek(self.data_offset + start)
-        while remaining:
-            count = self.file.readinto(remaining)
-            if not count:
-                raise EOFError(f"Unexpected end of file reading tensor {name}")
-            remaining = remaining[count:]
-
-        if sys.byteorder == "big":
-            array.view(f"u{tensor.element_size()}").byteswap(inplace=True)
-
-        if needs_cast:
-            converted = torch.empty(
-                tensor.shape, dtype=dtype, device="cpu", pin_memory=pin_memory
-            )
-            converted.copy_(tensor)
-            tensor = converted
-        return tensor
+        entry = (handle, header, data_offset)
+        if cache is not None:
+            cache[key] = entry
+            while len(cache) > _MAX_OPEN_FILES:
+                _, evicted = cache.popitem(last=False)
+                evicted[0].__exit__(None, None, None)
+    elif cache is not None:
+        cache.move_to_end(key)
+    try:
+        yield entry
+    finally:
+        if cache is None:
+            entry[0].__exit__(None, None, None)
 
 
 def _file_key(file_path: str) -> str:
@@ -213,4 +141,4 @@ def _evict(file_path: str) -> None:
         return
     target = _file_key(file_path)
     for key in [key for key in cache if key[0] == target]:
-        cache.pop(key).__exit__(None, None, None)
+        cache.pop(key)[0].__exit__(None, None, None)

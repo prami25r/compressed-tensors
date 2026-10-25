@@ -305,7 +305,7 @@ def test_disk_load_context_closes_handles_on_exit(tmp_path):
     with disk_load_context():
         with _opened(str(shard), "cpu") as file:
             file.get_tensor("a")
-        held = list(disk_module._open_files.cache.values())
+        held = [entry[0] for entry in disk_module._open_files.cache.values()]
         assert held, "expected a cached handle"
     assert disk_module._open_files.cache is None
     for handle in held:
@@ -317,7 +317,7 @@ def test_disk_load_context_closes_handles_on_exit(tmp_path):
         with disk_load_context():
             with _opened(str(shard), "cpu") as file:
                 file.get_tensor("a")
-            held = list(disk_module._open_files.cache.values())
+            held = [entry[0] for entry in disk_module._open_files.cache.values()]
             raise RuntimeError("boom")
     for handle in held:
         with pytest.raises(Exception, match="closed"):
@@ -390,7 +390,12 @@ def _symlinked_shard(tmp_path, count):
 
 
 @pytest.mark.unit
-def test_disk_load_context_hits_across_checkpoint_symlinks(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "pin_memory", [False, pytest.param(True, marks=requires_gpu(1))]
+)
+def test_disk_load_context_hits_across_checkpoint_symlinks(
+    tmp_path, monkeypatch, pin_memory
+):
     """N tensors symlinked into one shard must share a single handle.
 
     This is the path the context exists for: the O(N**2) header parse only
@@ -401,12 +406,19 @@ def test_disk_load_context_hits_across_checkpoint_symlinks(tmp_path, monkeypatch
     assert len({DiskCache.index[m]["safetensors_file"] for m in offloaded}) == 8
 
     opens = _counting_safe_open(monkeypatch)
+    if pin_memory:
+        cache.onload_device = torch.accelerator.current_accelerator()
     with disk_load_context():
-        values = [cache.onload(meta) for meta in offloaded]
+        values = [
+            cache.stage(meta, pin_memory=True) if pin_memory else cache.onload(meta)
+            for meta in offloaded
+        ]
 
     assert len(opens) == 1, f"expected one open for one shard, got {len(opens)}"
     for i, value in enumerate(values):
         assert_tensor_equal(value, torch.full((4,), float(i)))
+        if pin_memory:
+            assert value.is_pinned()
 
 
 @pytest.mark.unit
